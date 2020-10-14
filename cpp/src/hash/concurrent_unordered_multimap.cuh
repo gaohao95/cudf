@@ -181,7 +181,7 @@ struct equal_to
     using first_argument_type = T;
     using second_argument_type = T;
     __forceinline__
-    __host__ __device__ constexpr bool operator()(const first_argument_type &lhs, const second_argument_type &rhs) const 
+    __host__ __device__ constexpr bool operator()(const first_argument_type &lhs, const second_argument_type &rhs) const
     {
         return lhs == rhs;
     }
@@ -190,18 +190,18 @@ struct equal_to
 template<typename Iterator>
 class cycle_iterator_adapter {
 public:
-    using value_type = typename std::iterator_traits<Iterator>::value_type; 
+    using value_type = typename std::iterator_traits<Iterator>::value_type;
     using difference_type = typename std::iterator_traits<Iterator>::difference_type;
     using pointer = typename std::iterator_traits<Iterator>::pointer;
     using reference = typename std::iterator_traits<Iterator>::reference;
     using iterator_type = Iterator;
-    
+
     cycle_iterator_adapter() = delete;
-    
+
     __host__ __device__ explicit cycle_iterator_adapter( const iterator_type& begin, const iterator_type& end, const iterator_type& current )
         : m_begin( begin ), m_end( end ), m_current( current )
     {}
-    
+
     __host__ __device__ cycle_iterator_adapter& operator++()
     {
         if ( m_end == (m_current+1) )
@@ -210,7 +210,7 @@ public:
             ++m_current;
         return *this;
     }
-    
+
     __host__ __device__ const cycle_iterator_adapter& operator++() const
     {
         if ( m_end == (m_current+1) )
@@ -219,7 +219,7 @@ public:
             ++m_current;
         return *this;
     }
-    
+
     __host__ __device__ cycle_iterator_adapter& operator++(int)
     {
         cycle_iterator_adapter<iterator_type> old( m_begin, m_end, m_current);
@@ -229,7 +229,7 @@ public:
             ++m_current;
         return old;
     }
-    
+
     __host__ __device__ const cycle_iterator_adapter& operator++(int) const
     {
         cycle_iterator_adapter<iterator_type> old( m_begin, m_end, m_current);
@@ -239,17 +239,17 @@ public:
             ++m_current;
         return old;
     }
-    
+
     __host__ __device__ bool equal(const cycle_iterator_adapter<iterator_type>& other) const
     {
         return m_current == other.m_current && m_begin == other.m_begin && m_end == other.m_end;
     }
-    
+
     __host__ __device__ reference& operator*()
     {
         return *m_current;
     }
-    
+
     __host__ __device__ const reference& operator*() const
     {
         return *m_current;
@@ -259,12 +259,12 @@ public:
     {
         return m_current.operator->();
     }
-    
+
     __host__ __device__ pointer operator->()
     {
         return m_current;
     }
-    
+
 private:
     iterator_type m_current;
     iterator_type m_begin;
@@ -318,7 +318,7 @@ private:
         unsigned long long int  longlong;
         value_type              pair;
     };
-    
+
 public:
 
     /* --------------------------------------------------------------------------*/
@@ -344,8 +344,8 @@ public:
         {
             cudaPointerAttributes hashtbl_values_ptr_attributes;
             cudaError_t status = cudaPointerGetAttributes( &hashtbl_values_ptr_attributes, m_hashtbl_values );
-            
-            if ( cudaSuccess == status && hashtbl_values_ptr_attributes.isManaged ) {
+
+            if ( cudaSuccess == status && hashtbl_values_ptr_attributes.type == cudaMemoryTypeManaged ) {
                 int dev_id = 0;
                 CUDA_RT_CALL( cudaGetDevice( &dev_id ) );
                 CUDA_RT_CALL( cudaMemPrefetchAsync(m_hashtbl_values, m_hashtbl_size*sizeof(value_type), dev_id, 0) );
@@ -359,12 +359,12 @@ public:
             CUDA_RT_CALL( cudaStreamSynchronize(0) );
         }
     }
-    
+
     ~concurrent_unordered_multimap()
     {
         m_allocator.deallocate( m_hashtbl_values, m_hashtbl_capacity );
     }
-    
+
     __host__ __device__ iterator begin()
     {
         return iterator( m_hashtbl_values,m_hashtbl_values+m_hashtbl_size,m_hashtbl_values );
@@ -381,13 +381,13 @@ public:
     {
         return const_iterator( m_hashtbl_values,m_hashtbl_values+m_hashtbl_size,m_hashtbl_values+m_hashtbl_size );
     }
-    
+
     __forceinline__
     static constexpr __host__ __device__ key_type get_unused_key()
     {
         return unused_key;
     }
-   
+
     /* --------------------------------------------------------------------------*/
     /**
      * @Synopsis Computes a hash value for a key
@@ -455,11 +455,11 @@ public:
     }
 
     /* --------------------------------------------------------------------------*/
-    /** 
+    /**
      * @Synopsis  Inserts a (key, value) pair into the hash map
-     * 
+     *
      * @Param[in] x The (key, value) pair to insert
-     * @Param[in] precomputed_hash A flag indicating whether or not a precomputed 
+     * @Param[in] precomputed_hash A flag indicating whether or not a precomputed
      * hash value is passed in
      * @Param[in] precomputed_hash_value A precomputed hash value to use for determing
      * the write location of the key into the hash map instead of computing the
@@ -467,7 +467,7 @@ public:
      * @Param[in] keys_are_equal An optional functor for comparing if two keys are equal
      * @tparam hash_value_type The datatype of the hash value
      * @tparam comparison_type The type of the key comparison functor
-     * 
+     *
      * @Returns An iterator to the newly inserted (key, value) pair
      */
     /* ----------------------------------------------------------------------------*/
@@ -501,7 +501,7 @@ public:
         value_type* it = 0;
 
         size_type attempt_counter{0};
-        
+
         while (0 == it) {
             value_type* tmp_it = hashtbl_values + hash_tbl_idx;
 
@@ -521,12 +521,12 @@ public:
                 {
                     atomicAdd( &m_collisions, 1 );
                 }
-            } 
-            else 
+            }
+            else
             {
                 const key_type old_key = atomicCAS( &(tmp_it->first), unused_key, x.first );
 
-                if ( keys_are_equal( unused_key, old_key ) ) 
+                if ( keys_are_equal( unused_key, old_key ) )
                 {
                     (m_hashtbl_values+hash_tbl_idx)->second = x.second;
                     it = tmp_it;
@@ -546,7 +546,7 @@ public:
               return this->end();
             }
         }
-        
+
         return iterator( m_hashtbl_values,m_hashtbl_values+hashtbl_size,it);
     }
 
@@ -597,7 +597,7 @@ public:
           hash_value = m_hf(x.first);
         }
 
-	// Find the destination partition index 
+	// Find the destination partition index
 	int dest_part = get_partition(x.first, num_parts, true, hash_value);
 
         // Only insert if the key belongs to the specified partition
@@ -606,14 +606,14 @@ public:
         else
           return insert(x, true, hash_value, keys_are_equal);
     }
-    
+
     /* --------------------------------------------------------------------------*/
-    /** 
+    /**
      * @Synopsis Searches for a key in the hash map and returns an iterator to the first
      * instance of the key in the map.
-     * 
+     *
      * @Param[in] the_key The key to search for
-     * @Param[in] precomputed_hash A flag indicating whether or not a precomputed 
+     * @Param[in] precomputed_hash A flag indicating whether or not a precomputed
      * hash value is passed in
      * @Param[in] precomputed_hash_value A precomputed hash value to use for determing
      * the write location of the key into the hash map instead of computing the
@@ -621,7 +621,7 @@ public:
      * @Param[in] keys_are_equal An optional functor for comparing if two keys are equal
      * @tparam hash_value_type The datatype of the hash value
      * @tparam comparison_type The type of the key comparison functor
-     * 
+     *
      * @Returns   An iterator to the first instance of the key in the map
      */
     /* ----------------------------------------------------------------------------*/
@@ -636,7 +636,7 @@ public:
         hash_value_type hash_value{0};
 
         // If a precomputed hash value has been passed in, then use it to determine
-        // the location of the key 
+        // the location of the key
         if(true == precomputed_hash) {
           hash_value = precomputed_hash_value;
         }
@@ -648,9 +648,9 @@ public:
         size_type hash_tbl_idx = hash_value % m_hashtbl_size;
 
         value_type* begin_ptr = 0;
-        
+
         size_type counter = 0;
-        while ( 0 == begin_ptr ) 
+        while ( 0 == begin_ptr )
         {
             value_type* tmp_ptr = m_hashtbl_values + hash_tbl_idx;
             const key_type tmp_val = tmp_ptr->first;
@@ -665,7 +665,7 @@ public:
             hash_tbl_idx = (hash_tbl_idx+1)%m_hashtbl_size;
             ++counter;
         }
-        
+
         return const_iterator( m_hashtbl_values,m_hashtbl_values+m_hashtbl_size,begin_ptr);
     }
 
@@ -678,57 +678,57 @@ public:
             m_allocator.deallocate( m_hashtbl_values, m_hashtbl_capacity );
             m_hashtbl_capacity = other.m_hashtbl_size;
             m_hashtbl_size = other.m_hashtbl_size;
-            
+
             m_hashtbl_values = m_allocator.allocate( m_hashtbl_capacity );
         }
         CUDA_TRY( cudaMemcpyAsync( m_hashtbl_values, other.m_hashtbl_values, m_hashtbl_size*sizeof(value_type), cudaMemcpyDefault, stream ) );
 
         return GDF_SUCCESS;
     }
-    
-    void clear_async( cudaStream_t stream = 0 ) 
+
+    void clear_async( cudaStream_t stream = 0 )
     {
         constexpr int block_size = 128;
         init_hashtbl<<<((m_hashtbl_size-1)/block_size)+1,block_size,0,stream>>>( m_hashtbl_values, m_hashtbl_size, unused_key, unused_element );
         if ( count_collisions )
             m_collisions = 0;
     }
-    
+
     unsigned long long get_num_collisions() const
     {
         return m_collisions;
     }
-    
+
     void print()
     {
-        for (size_type i = 0; i < m_hashtbl_size; ++i) 
+        for (size_type i = 0; i < m_hashtbl_size; ++i)
         {
             std::cout<<i<<": "<<m_hashtbl_values[i].first<<","<<m_hashtbl_values[i].second<<std::endl;
         }
     }
-    
+
     gdf_error prefetch( const int dev_id, cudaStream_t stream = 0 )
     {
         cudaPointerAttributes hashtbl_values_ptr_attributes;
         cudaError_t status = cudaPointerGetAttributes( &hashtbl_values_ptr_attributes, m_hashtbl_values );
-        
-        if ( cudaSuccess == status && hashtbl_values_ptr_attributes.isManaged ) {
+
+        if ( cudaSuccess == status && hashtbl_values_ptr_attributes.type == cudaMemoryTypeManaged ) {
             CUDA_TRY( cudaMemPrefetchAsync(m_hashtbl_values, m_hashtbl_size*sizeof(value_type), dev_id, stream) );
         }
         CUDA_TRY( cudaMemPrefetchAsync(this, sizeof(*this), dev_id, stream) );
         return GDF_SUCCESS;
     }
-    
+
 private:
     const hasher            m_hf;
     const key_equal         m_equal;
-    
+
     allocator_type              m_allocator;
-    
+
     size_type   m_hashtbl_size;
     size_type   m_hashtbl_capacity;
     value_type* m_hashtbl_values;
-    
+
     unsigned long long m_collisions;
 };
 
