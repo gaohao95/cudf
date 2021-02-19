@@ -343,7 +343,7 @@ class concurrent_unordered_multimap {
         if (old_val == unused) {
           it = tmp_it;
         } else if (count_collisions) {
-          atomicAdd(&m_collisions, 1);
+          atomicAdd(m_collisions, 1);
         }
       } else {
         const key_type old_key = atomicCAS(&(tmp_it->first), unused_key, x.first);
@@ -352,7 +352,7 @@ class concurrent_unordered_multimap {
           (m_hashtbl_values + hash_tbl_idx)->second = x.second;
           it                                        = tmp_it;
         } else if (count_collisions) {
-          atomicAdd(&m_collisions, 1);
+          atomicAdd(m_collisions, 1);
         }
       }
 
@@ -488,7 +488,10 @@ class concurrent_unordered_multimap {
   void assign_async(const concurrent_unordered_multimap& other,
                     rmm::cuda_stream_view stream = rmm::cuda_stream_default)
   {
-    m_collisions = other.m_collisions;
+    if (count_collisions) {
+      cudaMemcpyAsync(
+        m_collisions, other.m_collisions, sizeof(unsigned long long), cudaMemcpyDeviceToDevice);
+    }
     if (other.m_hashtbl_size <= m_hashtbl_capacity) {
       m_hashtbl_size = other.m_hashtbl_size;
     } else {
@@ -510,10 +513,19 @@ class concurrent_unordered_multimap {
     constexpr int block_size = 128;
     init_hashtbl<<<((m_hashtbl_size - 1) / block_size) + 1, block_size, 0, stream.value()>>>(
       m_hashtbl_values, m_hashtbl_size, unused_key, unused_element);
-    if (count_collisions) m_collisions = 0;
+    if (count_collisions) cudaMemset(m_collisions, 0, sizeof(unsigned long long));
   }
 
-  unsigned long long get_num_collisions() const { return m_collisions; }
+  unsigned long long get_num_collisions() const
+  {
+    unsigned long long num_collisions = 0;
+
+    if (count_collisions) {
+      cudaMemcpy(&num_collisions, m_collisions, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+    }
+
+    return num_collisions;
+  }
 
   void print()
   {
@@ -548,7 +560,7 @@ class concurrent_unordered_multimap {
   size_type m_hashtbl_size;
   size_type m_hashtbl_capacity;
   value_type* m_hashtbl_values;
-  unsigned long long m_collisions;
+  unsigned long long* m_collisions;
 
   /**
    * @brief Private constructor used by `create` factory function.
@@ -574,7 +586,7 @@ class concurrent_unordered_multimap {
       m_allocator(a),
       m_hashtbl_size(n),
       m_hashtbl_capacity(n),
-      m_collisions(0)
+      m_collisions(nullptr)
   {
     m_hashtbl_values         = m_allocator.allocate(m_hashtbl_capacity, stream);
     constexpr int block_size = 128;
@@ -596,6 +608,8 @@ class concurrent_unordered_multimap {
         m_hashtbl_values, m_hashtbl_size, unused_key, unused_element);
       CUDA_TRY(cudaGetLastError());
     }
+
+    if (count_collisions) { cudaMalloc((void**)&m_collisions, sizeof(unsigned long long)); }
   }
 };
 

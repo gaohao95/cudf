@@ -39,12 +39,15 @@ using multimap_type =
                                 size_t,
                                 std::numeric_limits<hash_value_type>::max(),
                                 std::numeric_limits<size_type>::max(),
-                                IdentityHash<hash_value_type>,
+                                // default_hash<hash_value_type>,
+                                // IdentityHash<hash_value_type>,
+                                MurmurHash3_32_v2<hash_value_type>,
                                 equal_to<hash_value_type>,
                                 default_allocator<thrust::pair<hash_value_type, size_type>>>;
 
 // using row_hash = cudf::row_hasher<default_hash>;
-using row_hash = cudf::row_hasher<IdentityHash>;
+// using row_hash = cudf::row_hasher<IdentityHash>;
+using row_hash = cudf::row_hasher<MurmurHash3_32_v2>;
 
 using row_equality = cudf::row_equality_comparator<true>;
 

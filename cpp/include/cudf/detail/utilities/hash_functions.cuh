@@ -469,7 +469,7 @@ struct MurmurHash3_32 {
     return h1;
   }
 
- private:
+ protected:
   uint32_t m_seed;
 };
 
@@ -547,6 +547,11 @@ MurmurHash3_32<double>::operator()(double const& key) const
 {
   return this->compute_floating_point(key);
 }
+
+template <typename Key>
+struct MurmurHash3_32_v2 : public MurmurHash3_32<Key> {
+  CUDA_HOST_DEVICE_CALLABLE MurmurHash3_32_v2() : MurmurHash3_32<Key>(12345678) {}
+};
 
 /* --------------------------------------------------------------------------*/
 /**

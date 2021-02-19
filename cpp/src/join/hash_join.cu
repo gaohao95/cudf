@@ -21,6 +21,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <iostream>
 #include <numeric>
 
 namespace cudf {
@@ -604,6 +605,7 @@ hash_join::hash_join_impl::compute_hash_join(
                                                       ? cudf::detail::join_kind::LEFT_JOIN
                                                       : JoinKind;
   auto joined_indices = probe_join_indices<ProbeJoinKind>(probe_selected, compare_nulls, stream);
+  // std::cout << "Number of collisions: " << _hash_table->get_num_collisions() << std::endl;
   return cudf::detail::construct_join_output_df<JoinKind>(
     probe, _build, joined_indices, columns_in_common, common_columns_output_side, stream, mr);
 }
