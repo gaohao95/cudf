@@ -41,6 +41,68 @@ constexpr inline bool is_signed_iterator()
 namespace strings {
 namespace detail {
 
+constexpr int strings_per_threadblock = 128;
+
+template <bool NullifyOutOfBounds, typename MapIterator>
+__global__ void gather_chars_fn(char* out_chars,
+                                const char* in_chars,
+                                const cudf::size_type* out_offsets,
+                                const cudf::size_type* in_offsets,
+                                MapIterator string_indices,
+                                cudf::size_type total_out_strings,
+                                cudf::size_type total_in_strings)
+{
+  if (in_chars == nullptr || in_offsets == nullptr) return;
+
+  __shared__ cudf::size_type out_offsets_threadblock[strings_per_threadblock + 1];
+  __shared__ cudf::size_type in_offsets_threadblock[strings_per_threadblock];
+
+  // Current thread block will process output strings in range [begin_out_string_idx,
+  // end_out_string_idx)
+  cudf::size_type begin_out_string_idx = blockIdx.x * strings_per_threadblock;
+
+  // Collectively load offsets of strings processed by the current thread block
+  for (cudf::size_type idx = threadIdx.x; idx <= strings_per_threadblock; idx += blockDim.x) {
+    cudf::size_type out_string_idx = idx + begin_out_string_idx;
+    if (out_string_idx > total_out_strings) break;
+    out_offsets_threadblock[idx] = out_offsets[out_string_idx];
+  }
+
+  for (cudf::size_type idx = threadIdx.x; idx < strings_per_threadblock; idx += blockDim.x) {
+    cudf::size_type out_string_idx = idx + begin_out_string_idx;
+    if (out_string_idx >= total_out_strings) break;
+    cudf::size_type in_string_idx = string_indices[out_string_idx];
+    if (NullifyOutOfBounds) {
+      if (is_signed_iterator<MapIterator>()
+            ? ((in_string_idx < 0) || (in_string_idx >= total_in_strings))
+            : (in_string_idx >= total_in_strings))
+        continue;
+    }
+    in_offsets_threadblock[idx] = in_offsets[in_string_idx];
+  }
+  __syncthreads();
+
+  cudf::size_type strings_current_threadblock =
+    min(strings_per_threadblock, total_out_strings - begin_out_string_idx);
+
+  for (int out_ibyte = threadIdx.x + out_offsets_threadblock[0];
+       out_ibyte < out_offsets_threadblock[strings_current_threadblock];
+       out_ibyte += blockDim.x) {
+    // binary search for the string index corresponding to out_ibyte
+    cudf::size_type string_idx = 0;
+    for (int i = 64; i > 0; i /= 2) {
+      if (string_idx + i < strings_current_threadblock &&
+          out_offsets_threadblock[string_idx + i] <= out_ibyte)
+        string_idx += i;
+    }
+
+    // calculate which character to load within the string
+    cudf::size_type icharacter = out_ibyte - out_offsets_threadblock[string_idx];
+
+    out_chars[out_ibyte] = in_chars[in_offsets_threadblock[string_idx] + icharacter];
+  }
+}
+
 /**
  * @brief Returns a new strings column using the specified indices to select
  * elements from the `strings` column.
@@ -112,25 +174,11 @@ std::unique_ptr<cudf::column> gather(
   auto const d_out_chars = out_chars_column->mutable_view().template data<char>();
 
   // fill in chars
-  cudf::detail::device_span<int32_t const> const d_out_offsets_span(d_out_offsets,
-                                                                    output_count + 1);
   auto const d_in_chars = (strings_count > 0) ? strings.chars().data<char>() : nullptr;
-  auto gather_chars_fn =
-    [d_out_offsets_span, begin, d_in_offsets, d_in_chars] __device__(size_type out_char_idx) {
-      // find output row index for this output char index
-      auto const next_row_ptr = thrust::upper_bound(
-        thrust::seq, d_out_offsets_span.begin(), d_out_offsets_span.end(), out_char_idx);
-      auto const out_row_idx     = thrust::distance(d_out_offsets_span.begin(), next_row_ptr) - 1;
-      auto const str_char_offset = out_char_idx - d_out_offsets_span[out_row_idx];
-      auto const in_row_idx      = begin[out_row_idx];
-      auto const in_char_offset  = d_in_offsets[in_row_idx] + str_char_offset;
-      return d_in_chars[in_char_offset];
-    };
-  thrust::transform(rmm::exec_policy(stream),
-                    thrust::make_counting_iterator<size_type>(0),
-                    thrust::make_counting_iterator<size_type>(out_chars_bytes),
-                    d_out_chars,
-                    gather_chars_fn);
+
+  int num_threadblocks = (output_count + strings_per_threadblock - 1) / strings_per_threadblock;
+  gather_chars_fn<NullifyOutOfBounds, MapIterator><<<num_threadblocks, 128, 0, stream.value()>>>(
+    d_out_chars, d_in_chars, d_out_offsets, d_in_offsets, begin, output_count, strings_count);
 
   return make_strings_column(output_count,
                              std::move(out_offsets_column),
