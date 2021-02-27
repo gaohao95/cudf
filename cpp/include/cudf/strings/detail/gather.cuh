@@ -41,9 +41,10 @@ constexpr inline bool is_signed_iterator()
 namespace strings {
 namespace detail {
 
-constexpr int strings_per_threadblock = 128;
+constexpr int out_chars_shared_memory_size = 4096;
 
-template <bool NullifyOutOfBounds, typename MapIterator>
+// Note: strings_per_threadblock must be a exponential of 2
+template <bool NullifyOutOfBounds, typename MapIterator, int strings_per_threadblock>
 __global__ void gather_chars_fn(char* out_chars,
                                 const char* in_chars,
                                 const cudf::size_type* out_offsets,
@@ -54,11 +55,15 @@ __global__ void gather_chars_fn(char* out_chars,
 {
   if (in_chars == nullptr || in_offsets == nullptr) return;
 
+  // out_offsets_threadblock has (strings_per_threadblock + 1) elements
   __shared__ cudf::size_type out_offsets_threadblock[strings_per_threadblock + 1];
+  // in_offsets_threadblock has (strings_per_threadblock) elements
   __shared__ cudf::size_type in_offsets_threadblock[strings_per_threadblock];
+  // temporary output buffer
+  __shared__ int out_chars_shared_aligned[out_chars_shared_memory_size / 4];
+  char* out_chars_shared = (char*)(out_chars_shared_aligned);
 
-  // Current thread block will process output strings in range [begin_out_string_idx,
-  // end_out_string_idx)
+  // Current thread block will process output strings starting at begin_out_string_idx
   cudf::size_type begin_out_string_idx = blockIdx.x * strings_per_threadblock;
 
   // Collectively load offsets of strings processed by the current thread block
@@ -85,21 +90,51 @@ __global__ void gather_chars_fn(char* out_chars,
   cudf::size_type strings_current_threadblock =
     min(strings_per_threadblock, total_out_strings - begin_out_string_idx);
 
-  for (int out_ibyte = threadIdx.x + out_offsets_threadblock[0];
-       out_ibyte < out_offsets_threadblock[strings_current_threadblock];
-       out_ibyte += blockDim.x) {
-    // binary search for the string index corresponding to out_ibyte
-    cudf::size_type string_idx = 0;
-    for (int i = 64; i > 0; i /= 2) {
-      if (string_idx + i < strings_current_threadblock &&
-          out_offsets_threadblock[string_idx + i] <= out_ibyte)
-        string_idx += i;
+  int num_batches = (out_offsets_threadblock[strings_current_threadblock] -
+                     out_offsets_threadblock[0] + out_chars_shared_memory_size - 1) /
+                    out_chars_shared_memory_size;
+
+  for (int ibatch = 0; ibatch < num_batches; ibatch++) {
+    cudf::size_type batch_start_out_ibyte =
+      out_offsets_threadblock[0] + out_chars_shared_memory_size * ibatch;
+    cudf::size_type batch_end_out_ibyte =
+      min(out_offsets_threadblock[0] + out_chars_shared_memory_size * (ibatch + 1),
+          out_offsets_threadblock[strings_current_threadblock]);
+    cudf::size_type aligned_batch_start_out_ibyte = (batch_start_out_ibyte + 3) / 4 * 4;
+    cudf::size_type aligned_batch_end_out_ibyte   = batch_end_out_ibyte / 4 * 4;
+    for (int out_ibyte = threadIdx.x + batch_start_out_ibyte; out_ibyte < batch_end_out_ibyte;
+         out_ibyte += blockDim.x) {
+      // binary search for the string index corresponding to out_ibyte
+      cudf::size_type string_idx = 0;
+      for (int i = strings_per_threadblock / 2; i > 0; i /= 2) {
+        if (string_idx + i < strings_current_threadblock &&
+            out_offsets_threadblock[string_idx + i] <= out_ibyte)
+          string_idx += i;
+      }
+
+      // calculate which character to load within the string
+      cudf::size_type icharacter = out_ibyte - out_offsets_threadblock[string_idx];
+
+      // load the charater into shared memory
+      if (out_ibyte < aligned_batch_start_out_ibyte || out_ibyte >= aligned_batch_end_out_ibyte) {
+        out_chars[out_ibyte] = in_chars[in_offsets_threadblock[string_idx] + icharacter];
+      } else {
+        out_chars_shared[out_ibyte - aligned_batch_start_out_ibyte] =
+          in_chars[in_offsets_threadblock[string_idx] + icharacter];
+      }
+    }
+    __syncthreads();
+
+    int* out_chars_aligned = (int*)out_chars;
+
+    for (cudf::size_type out_iword = aligned_batch_start_out_ibyte / 4 + threadIdx.x;
+         out_iword < aligned_batch_end_out_ibyte / 4;
+         out_iword += blockDim.x) {
+      out_chars_aligned[out_iword] =
+        out_chars_shared_aligned[out_iword - aligned_batch_start_out_ibyte / 4];
     }
 
-    // calculate which character to load within the string
-    cudf::size_type icharacter = out_ibyte - out_offsets_threadblock[string_idx];
-
-    out_chars[out_ibyte] = in_chars[in_offsets_threadblock[string_idx] + icharacter];
+    __syncthreads();
   }
 }
 
@@ -176,9 +211,25 @@ std::unique_ptr<cudf::column> gather(
   // fill in chars
   auto const d_in_chars = (strings_count > 0) ? strings.chars().data<char>() : nullptr;
 
-  int num_threadblocks = (output_count + strings_per_threadblock - 1) / strings_per_threadblock;
-  gather_chars_fn<NullifyOutOfBounds, MapIterator><<<num_threadblocks, 128, 0, stream.value()>>>(
-    d_out_chars, d_in_chars, d_out_offsets, d_in_offsets, begin, output_count, strings_count);
+  if (output_count / 128 > 80 * 3) {
+    constexpr int strings_per_threadblock = 128;
+    int num_threadblocks = (output_count + strings_per_threadblock - 1) / strings_per_threadblock;
+    gather_chars_fn<NullifyOutOfBounds, MapIterator, strings_per_threadblock>
+      <<<num_threadblocks, 128, 0, stream.value()>>>(
+        d_out_chars, d_in_chars, d_out_offsets, d_in_offsets, begin, output_count, strings_count);
+  } else if (output_count / 16 > 80 * 3) {
+    constexpr int strings_per_threadblock = 16;
+    int num_threadblocks = (output_count + strings_per_threadblock - 1) / strings_per_threadblock;
+    gather_chars_fn<NullifyOutOfBounds, MapIterator, strings_per_threadblock>
+      <<<num_threadblocks, 128, 0, stream.value()>>>(
+        d_out_chars, d_in_chars, d_out_offsets, d_in_offsets, begin, output_count, strings_count);
+  } else {
+    constexpr int strings_per_threadblock = 2;
+    int num_threadblocks = (output_count + strings_per_threadblock - 1) / strings_per_threadblock;
+    gather_chars_fn<NullifyOutOfBounds, MapIterator, strings_per_threadblock>
+      <<<num_threadblocks, 128, 0, stream.value()>>>(
+        d_out_chars, d_in_chars, d_out_offsets, d_in_offsets, begin, output_count, strings_count);
+  }
 
   return make_strings_column(output_count,
                              std::move(out_offsets_column),
