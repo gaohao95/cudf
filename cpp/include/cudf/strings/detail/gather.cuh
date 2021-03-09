@@ -43,6 +43,22 @@ namespace detail {
 
 constexpr int strings_per_threadblock = 128;
 
+/**
+ * Binary search for at most 128 elements.
+ * @param max_nelements Must be less than 128.
+ */
+__forceinline__ __device__ cudf::size_type binary_search(cudf::size_type* offset,
+                                                         cudf::size_type value,
+                                                         cudf::size_type max_nelements)
+{
+  cudf::size_type idx = 0;
+#pragma unroll
+  for (cudf::size_type i = 64; i > 0; i /= 2) {
+    if (idx + i < max_nelements && offset[idx + i] <= value) idx += i;
+  }
+  return idx;
+}
+
 template <bool NullifyOutOfBounds, typename MapIterator>
 __global__ void gather_chars_fn(char* out_chars,
                                 const char* in_chars,
@@ -89,12 +105,8 @@ __global__ void gather_chars_fn(char* out_chars,
        out_ibyte < out_offsets_threadblock[strings_current_threadblock];
        out_ibyte += blockDim.x) {
     // binary search for the string index corresponding to out_ibyte
-    cudf::size_type string_idx = 0;
-    for (int i = 64; i > 0; i /= 2) {
-      if (string_idx + i < strings_current_threadblock &&
-          out_offsets_threadblock[string_idx + i] <= out_ibyte)
-        string_idx += i;
-    }
+    cudf::size_type string_idx =
+      binary_search(out_offsets_threadblock, out_ibyte, strings_current_threadblock);
 
     // calculate which character to load within the string
     cudf::size_type icharacter = out_ibyte - out_offsets_threadblock[string_idx];
