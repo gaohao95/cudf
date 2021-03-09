@@ -82,16 +82,16 @@ __forceinline__ __device__ void copy_4b(char* dest_ptr, const char* src_ptr)
     uint32_t val1 = (uint32_t)(*(src_ptr + 1));
     uint32_t val2 = (uint32_t)(*(src_ptr + 2));
     uint32_t val3 = (uint32_t)(*(src_ptr + 3));
-    val           = (val0 << 24) + (val1 << 16) + (val2 << 8) + val3;
+    val           = (val3 << 24) + (val2 << 16) + (val1 << 8) + val0;
   }
 
   if (dest_aligned) {
     *((uint32_t*)(dest_ptr)) = val;
   } else {
-    *dest_ptr       = (char)((val & 0xFF000000) >> 24);
-    *(dest_ptr + 1) = (char)((val & 0x00FF0000) >> 16);
-    *(dest_ptr + 2) = (char)((val & 0x0000FF00) >> 8);
-    *(dest_ptr + 3) = (char)((val & 0x000000FF));
+    *dest_ptr       = (char)((val & 0x000000FF));
+    *(dest_ptr + 1) = (char)((val & 0x0000FF00) >> 8);
+    *(dest_ptr + 2) = (char)((val & 0x00FF0000) >> 16);
+    *(dest_ptr + 3) = (char)((val & 0xFF000000) >> 24);
   }
 }
 
@@ -164,7 +164,6 @@ __global__ void gather_chars_fn(char* out_chars,
 
     cudf::size_type string_idx1;
     cudf::size_type string_idx2;
-
     cudf::size_type icharacter;
 
     if (string_idx0 == string_idx3) {
