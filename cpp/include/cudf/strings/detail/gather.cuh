@@ -30,6 +30,8 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/transform.h>
 
+#include <cstdint>
+
 namespace cudf {
 
 template <typename Iterator>
@@ -57,6 +59,40 @@ __forceinline__ __device__ cudf::size_type binary_search(cudf::size_type* offset
     if (idx + i < max_nelements && offset[idx + i] <= value) idx += i;
   }
   return idx;
+}
+
+__forceinline__ __device__ void copy_4b(char* dest_ptr, const char* src_ptr)
+{
+  uint32_t val;
+  bool src_aligned  = !((uintptr_t)src_ptr % 4);
+  bool dest_aligned = !((uintptr_t)dest_ptr % 4);
+
+  if (!src_aligned && !dest_aligned) {
+    *dest_ptr       = *src_ptr;
+    *(dest_ptr + 1) = *(src_ptr + 1);
+    *(dest_ptr + 2) = *(src_ptr + 2);
+    *(dest_ptr + 3) = *(src_ptr + 3);
+    return;
+  }
+
+  if (src_aligned) {
+    val = *((uint32_t*)(src_ptr));
+  } else {
+    uint32_t val0 = (uint32_t)(*src_ptr);
+    uint32_t val1 = (uint32_t)(*(src_ptr + 1));
+    uint32_t val2 = (uint32_t)(*(src_ptr + 2));
+    uint32_t val3 = (uint32_t)(*(src_ptr + 3));
+    val           = (val0 << 24) + (val1 << 16) + (val2 << 8) + val3;
+  }
+
+  if (dest_aligned) {
+    *((uint32_t*)(dest_ptr)) = val;
+  } else {
+    *dest_ptr       = (char)((val & 0xFF000000) >> 24);
+    *(dest_ptr + 1) = (char)((val & 0x00FF0000) >> 16);
+    *(dest_ptr + 2) = (char)((val & 0x0000FF00) >> 8);
+    *(dest_ptr + 3) = (char)((val & 0x000000FF));
+  }
 }
 
 template <bool NullifyOutOfBounds, typename MapIterator>
@@ -101,17 +137,59 @@ __global__ void gather_chars_fn(char* out_chars,
   cudf::size_type strings_current_threadblock =
     min(strings_per_threadblock, total_out_strings - begin_out_string_idx);
 
-  for (int out_ibyte = threadIdx.x + out_offsets_threadblock[0];
+  for (int out_ibyte = threadIdx.x * 4 + out_offsets_threadblock[0];
        out_ibyte < out_offsets_threadblock[strings_current_threadblock];
-       out_ibyte += blockDim.x) {
+       out_ibyte += blockDim.x * 4) {
+    if (out_ibyte + 3 >= out_offsets_threadblock[strings_current_threadblock]) {
+      while (out_ibyte < out_offsets_threadblock[strings_current_threadblock]) {
+        // binary search for the string index corresponding to out_ibyte
+        cudf::size_type string_idx =
+          binary_search(out_offsets_threadblock, out_ibyte, strings_current_threadblock);
+
+        // calculate which character to load within the string
+        cudf::size_type icharacter = out_ibyte - out_offsets_threadblock[string_idx];
+
+        out_chars[out_ibyte] = in_chars[in_offsets_threadblock[string_idx] + icharacter];
+        out_ibyte++;
+      }
+      break;
+    }
+
     // binary search for the string index corresponding to out_ibyte
-    cudf::size_type string_idx =
+    cudf::size_type string_idx0 =
       binary_search(out_offsets_threadblock, out_ibyte, strings_current_threadblock);
 
-    // calculate which character to load within the string
-    cudf::size_type icharacter = out_ibyte - out_offsets_threadblock[string_idx];
+    cudf::size_type string_idx3 =
+      binary_search(out_offsets_threadblock, out_ibyte + 3, strings_current_threadblock);
 
-    out_chars[out_ibyte] = in_chars[in_offsets_threadblock[string_idx] + icharacter];
+    cudf::size_type string_idx1;
+    cudf::size_type string_idx2;
+
+    cudf::size_type icharacter;
+
+    if (string_idx0 == string_idx3) {
+      icharacter = out_ibyte - out_offsets_threadblock[string_idx0];
+      copy_4b(out_chars + out_ibyte, in_chars + in_offsets_threadblock[string_idx0] + icharacter);
+      continue;
+    } else {
+      string_idx1 =
+        binary_search(out_offsets_threadblock, out_ibyte + 1, strings_current_threadblock);
+      string_idx2 =
+        binary_search(out_offsets_threadblock, out_ibyte + 2, strings_current_threadblock);
+    }
+
+    // calculate which character to load within the string
+    icharacter           = out_ibyte - out_offsets_threadblock[string_idx0];
+    out_chars[out_ibyte] = in_chars[in_offsets_threadblock[string_idx0] + icharacter];
+
+    icharacter               = out_ibyte + 1 - out_offsets_threadblock[string_idx1];
+    out_chars[out_ibyte + 1] = in_chars[in_offsets_threadblock[string_idx1] + icharacter];
+
+    icharacter               = out_ibyte + 2 - out_offsets_threadblock[string_idx2];
+    out_chars[out_ibyte + 2] = in_chars[in_offsets_threadblock[string_idx2] + icharacter];
+
+    icharacter               = out_ibyte + 3 - out_offsets_threadblock[string_idx3];
+    out_chars[out_ibyte + 3] = in_chars[in_offsets_threadblock[string_idx3] + icharacter];
   }
 }
 
