@@ -41,11 +41,13 @@ constexpr inline bool is_signed_iterator()
 namespace strings {
 namespace detail {
 
-constexpr int strings_per_threadblock = 128;
+constexpr int strings_per_threadblock = 32;
 
 /**
- * Binary search for at most 128 elements.
- * @param max_nelements Must be less than 128.
+ * Binary search for at most strings_per_threadblock elements.
+ *
+ * Requires strings_per_threadblock to be an exponential of 2.
+ * @param max_nelements Must be less than strings_per_threadblock.
  */
 __forceinline__ __device__ cudf::size_type binary_search(cudf::size_type* offset,
                                                          cudf::size_type value,
@@ -53,7 +55,7 @@ __forceinline__ __device__ cudf::size_type binary_search(cudf::size_type* offset
 {
   cudf::size_type idx = 0;
 #pragma unroll
-  for (cudf::size_type i = 64; i > 0; i /= 2) {
+  for (cudf::size_type i = strings_per_threadblock / 2; i > 0; i /= 2) {
     if (idx + i < max_nelements && offset[idx + i] <= value) idx += i;
   }
   return idx;
