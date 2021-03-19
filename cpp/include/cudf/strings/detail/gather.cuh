@@ -41,26 +41,6 @@ constexpr inline bool is_signed_iterator()
 namespace strings {
 namespace detail {
 
-constexpr int strings_per_threadblock = 32;
-
-/**
- * Binary search for at most strings_per_threadblock elements.
- *
- * Requires strings_per_threadblock to be an exponential of 2.
- * @param max_nelements Must be less than strings_per_threadblock.
- */
-__forceinline__ __device__ cudf::size_type binary_search(cudf::size_type* offset,
-                                                         cudf::size_type value,
-                                                         cudf::size_type max_nelements)
-{
-  cudf::size_type idx = 0;
-#pragma unroll
-  for (cudf::size_type i = strings_per_threadblock / 2; i > 0; i /= 2) {
-    if (idx + i < max_nelements && offset[idx + i] <= value) idx += i;
-  }
-  return idx;
-}
-
 template <bool NullifyOutOfBounds, typename MapIterator>
 __global__ void gather_chars_fn(char* out_chars,
                                 const char* in_chars,
@@ -72,48 +52,28 @@ __global__ void gather_chars_fn(char* out_chars,
 {
   if (in_chars == nullptr || in_offsets == nullptr) return;
 
-  __shared__ cudf::size_type out_offsets_threadblock[strings_per_threadblock + 1];
-  __shared__ cudf::size_type in_offsets_threadblock[strings_per_threadblock];
+  int global_thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+  int global_warp_id   = global_thread_id / 32;
+  int warp_lane        = global_thread_id % 32;
+  int nwarps           = gridDim.x * blockDim.x / 32;
 
-  // Current thread block will process output strings in range [begin_out_string_idx,
-  // end_out_string_idx)
-  cudf::size_type begin_out_string_idx = blockIdx.x * strings_per_threadblock;
-
-  // Collectively load offsets of strings processed by the current thread block
-  for (cudf::size_type idx = threadIdx.x; idx <= strings_per_threadblock; idx += blockDim.x) {
-    cudf::size_type out_string_idx = idx + begin_out_string_idx;
-    if (out_string_idx > total_out_strings) break;
-    out_offsets_threadblock[idx] = out_offsets[out_string_idx];
-  }
-
-  for (cudf::size_type idx = threadIdx.x; idx < strings_per_threadblock; idx += blockDim.x) {
-    cudf::size_type out_string_idx = idx + begin_out_string_idx;
-    if (out_string_idx >= total_out_strings) break;
-    cudf::size_type in_string_idx = string_indices[out_string_idx];
+  for (cudf::size_type istring = global_warp_id; istring < total_out_strings; istring += nwarps) {
+    cudf::size_type in_string_idx = string_indices[istring];
     if (NullifyOutOfBounds) {
       if (is_signed_iterator<MapIterator>()
             ? ((in_string_idx < 0) || (in_string_idx >= total_in_strings))
             : (in_string_idx >= total_in_strings))
         continue;
     }
-    in_offsets_threadblock[idx] = in_offsets[in_string_idx];
-  }
-  __syncthreads();
 
-  cudf::size_type strings_current_threadblock =
-    min(strings_per_threadblock, total_out_strings - begin_out_string_idx);
+    cudf::size_type in_start    = in_offsets[in_string_idx];
+    cudf::size_type out_start   = out_offsets[istring];
+    cudf::size_type out_end     = out_offsets[istring + 1];
+    cudf::size_type string_size = out_end - out_start;
 
-  for (int out_ibyte = threadIdx.x + out_offsets_threadblock[0];
-       out_ibyte < out_offsets_threadblock[strings_current_threadblock];
-       out_ibyte += blockDim.x) {
-    // binary search for the string index corresponding to out_ibyte
-    cudf::size_type string_idx =
-      binary_search(out_offsets_threadblock, out_ibyte, strings_current_threadblock);
-
-    // calculate which character to load within the string
-    cudf::size_type icharacter = out_ibyte - out_offsets_threadblock[string_idx];
-
-    out_chars[out_ibyte] = in_chars[in_offsets_threadblock[string_idx] + icharacter];
+    for (cudf::size_type ichar = warp_lane; ichar < string_size; ichar += 32) {
+      out_chars[out_start + ichar] = in_chars[in_start + ichar];
+    }
   }
 }
 
@@ -190,8 +150,7 @@ std::unique_ptr<cudf::column> gather(
   // fill in chars
   auto const d_in_chars = (strings_count > 0) ? strings.chars().data<char>() : nullptr;
 
-  int num_threadblocks = (output_count + strings_per_threadblock - 1) / strings_per_threadblock;
-  gather_chars_fn<NullifyOutOfBounds, MapIterator><<<num_threadblocks, 128, 0, stream.value()>>>(
+  gather_chars_fn<NullifyOutOfBounds, MapIterator><<<65536, 128, 0, stream.value()>>>(
     d_out_chars, d_in_chars, d_out_offsets, d_in_offsets, begin, output_count, strings_count);
 
   return make_strings_column(output_count,
