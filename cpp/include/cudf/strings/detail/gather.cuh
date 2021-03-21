@@ -30,6 +30,9 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/transform.h>
 
+constexpr int warps_per_threadblock = 4;
+constexpr int threadblock_size      = warps_per_threadblock * 32;
+
 namespace cudf {
 
 template <typename Iterator>
@@ -52,10 +55,21 @@ __global__ void gather_chars_fn(char* out_chars,
 {
   if (in_chars == nullptr || in_offsets == nullptr) return;
 
+  __shared__ char out_block[warps_per_threadblock][512];
+  __shared__ char in_block[warps_per_threadblock][512];
+
   int global_thread_id = blockIdx.x * blockDim.x + threadIdx.x;
   int global_warp_id   = global_thread_id / 32;
   int warp_lane        = global_thread_id % 32;
+  int local_warp_id    = threadIdx.x / 32;
   int nwarps           = gridDim.x * blockDim.x / 32;
+
+  /*
+  int* out_chars_aligned = (int*)out_chars;
+  int* in_chars_aligned  = (int*)in_chars;
+  int* out_block_aligned = (int*)(out_block + 512 * local_warp_id);
+  int* in_block_aligned  = (int*)(in_block + 512 * local_warp_id);
+  */
 
   for (cudf::size_type istring = global_warp_id; istring < total_out_strings; istring += nwarps) {
     cudf::size_type in_string_idx = string_indices[istring];
@@ -66,13 +80,57 @@ __global__ void gather_chars_fn(char* out_chars,
         continue;
     }
 
-    cudf::size_type in_start    = in_offsets[in_string_idx];
-    cudf::size_type out_start   = out_offsets[istring];
-    cudf::size_type out_end     = out_offsets[istring + 1];
-    cudf::size_type string_size = out_end - out_start;
+    cudf::size_type out_start = out_offsets[istring];
+    cudf::size_type out_end   = out_offsets[istring + 1];
+    cudf::size_type in_start  = in_offsets[in_string_idx];
 
-    for (cudf::size_type ichar = warp_lane; ichar < string_size; ichar += 32) {
-      out_chars[out_start + ichar] = in_chars[in_start + ichar];
+    cudf::size_type out_start_aligned = (out_start + 3) / 4 * 4;
+    cudf::size_type out_end_aligned   = out_end / 4 * 4;
+
+    constexpr cudf::size_type block_size = 480;
+    cudf::size_type num_blocks =
+      (out_end_aligned - out_start_aligned + block_size - 1) / block_size;
+
+    for (cudf::size_type iblock = 0; iblock < num_blocks; iblock++) {
+      cudf::size_type out_start_iblock = out_start_aligned + iblock * block_size;
+      cudf::size_type out_end_iblock   = min(out_start_iblock + block_size, out_end_aligned);
+
+      // Fetch data from input to shared memory
+      for (cudf::size_type ichar = out_start_iblock + warp_lane; ichar < out_end_iblock;
+           ichar += 32) {
+        in_block[local_warp_id][ichar - out_start_iblock] = in_chars[ichar - out_start + in_start];
+      }
+
+      __syncwarp();
+
+      // Copy from input unaligned buffer to output unaligned buffer
+      for (cudf::size_type ichar = out_start_iblock + warp_lane; ichar < out_end_iblock;
+           ichar += 32) {
+        out_block[local_warp_id][ichar - out_start_iblock] =
+          in_block[local_warp_id][ichar - out_start_iblock];
+      }
+
+      __syncwarp();
+
+      // Copy data from output aligned buffer to output
+      for (cudf::size_type ichar = out_start_iblock + warp_lane; ichar < out_end_iblock;
+           ichar += 32) {
+        out_chars[ichar] = out_block[local_warp_id][ichar - out_start_iblock];
+      }
+
+      __syncwarp();
+    }
+
+    if (num_blocks == 0) {
+      cudf::size_type ichar = out_start + warp_lane;
+      if (ichar < out_end) { out_chars[ichar] = in_chars[warp_lane + in_start]; }
+    } else {
+      if (out_start + warp_lane < out_start_aligned) {
+        out_chars[out_start + warp_lane] = in_chars[in_start + warp_lane];
+      }
+
+      cudf::size_type ichar = out_end_aligned + warp_lane;
+      if (ichar < out_end) { out_chars[ichar] = in_chars[ichar - out_start + in_start]; }
     }
   }
 }
