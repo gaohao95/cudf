@@ -64,12 +64,10 @@ __global__ void gather_chars_fn(char* out_chars,
   int local_warp_id    = threadIdx.x / 32;
   int nwarps           = gridDim.x * blockDim.x / 32;
 
-  /*
   int* out_chars_aligned = (int*)out_chars;
+  int* out_block_aligned = (int*)(out_block + local_warp_id);
   int* in_chars_aligned  = (int*)in_chars;
-  int* out_block_aligned = (int*)(out_block + 512 * local_warp_id);
-  int* in_block_aligned  = (int*)(in_block + 512 * local_warp_id);
-  */
+  int* in_block_aligned  = (int*)(in_block + local_warp_id);
 
   for (cudf::size_type istring = global_warp_id; istring < total_out_strings; istring += nwarps) {
     cudf::size_type in_string_idx = string_indices[istring];
@@ -94,11 +92,15 @@ __global__ void gather_chars_fn(char* out_chars,
     for (cudf::size_type iblock = 0; iblock < num_blocks; iblock++) {
       cudf::size_type out_start_iblock = out_start_aligned + iblock * block_size;
       cudf::size_type out_end_iblock   = min(out_start_iblock + block_size, out_end_aligned);
+      cudf::size_type in_start_iblock  = (out_start_iblock - out_start + in_start) / 4 * 4;
+      cudf::size_type in_end_iblock    = (out_end_iblock - out_start + in_start + 3) / 4 * 4;
 
       // Fetch data from input to shared memory
-      for (cudf::size_type ichar = out_start_iblock + warp_lane; ichar < out_end_iblock;
-           ichar += 32) {
-        in_block[local_warp_id][ichar - out_start_iblock] = in_chars[ichar - out_start + in_start];
+      cudf::size_type in_start_element = in_start_iblock / 4;
+      cudf::size_type in_end_element   = in_end_iblock / 4;
+      for (cudf::size_type ielement = in_start_element + warp_lane; ielement < in_end_element;
+           ielement += 32) {
+        in_block_aligned[ielement - in_start_element] = in_chars_aligned[ielement];
       }
 
       __syncwarp();
@@ -107,17 +109,19 @@ __global__ void gather_chars_fn(char* out_chars,
       for (cudf::size_type ichar = out_start_iblock + warp_lane; ichar < out_end_iblock;
            ichar += 32) {
         out_block[local_warp_id][ichar - out_start_iblock] =
-          in_block[local_warp_id][ichar - out_start_iblock];
+          in_block[local_warp_id][ichar - out_start + in_start - in_start_iblock];
       }
 
       __syncwarp();
 
       // Copy data from output aligned buffer to output
-      for (cudf::size_type ichar = out_start_iblock + warp_lane; ichar < out_end_iblock;
-           ichar += 32) {
-        out_chars[ichar] = out_block[local_warp_id][ichar - out_start_iblock];
-      }
+      cudf::size_type out_start_element = out_start_iblock / 4;
+      cudf::size_type out_end_element   = out_end_iblock / 4;
 
+      for (cudf::size_type ielement = out_start_element + warp_lane; ielement < out_end_element;
+           ielement += 32) {
+        out_chars_aligned[ielement] = out_block_aligned[ielement - out_start_element];
+      }
       __syncwarp();
     }
 
