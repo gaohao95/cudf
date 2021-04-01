@@ -89,6 +89,38 @@ std::unique_ptr<cudf::column> gather_chars(StringIterator strings_begin,
   return chars_column;
 }
 
+/*
+__forceinline__ __device__ int load_int(const char* ptr)
+{
+  unsigned int shift = (unsigned int)((size_t)ptr & 3) * 8;
+  int* lo            = (int*)((size_t)ptr & (~3));
+  int* hi            = lo + 1;
+
+  return __funnelshift_r(*lo, *hi, shift);
+}
+*/
+
+__forceinline__ __device__ uint4 load_uint4(const char* ptr)
+{
+  unsigned int* aligned_ptr = (unsigned int*)((size_t)ptr & ~(3));
+  uint4 regs                = {0, 0, 0, 0};
+
+  regs.x    = aligned_ptr[0];
+  regs.y    = aligned_ptr[1];
+  regs.z    = aligned_ptr[2];
+  regs.w    = aligned_ptr[3];
+  uint tail = aligned_ptr[4];
+
+  unsigned int shift = ((size_t)ptr & 3) * 8;
+
+  regs.x = __funnelshift_r(regs.x, regs.y, shift);
+  regs.y = __funnelshift_r(regs.y, regs.z, shift);
+  regs.z = __funnelshift_r(regs.z, regs.w, shift);
+  regs.w = __funnelshift_r(regs.w, tail, shift);
+
+  return regs;
+}
+
 template <bool NullifyOutOfBounds, typename MapIterator>
 __global__ void gather_chars_fn(char* out_chars,
                                 const char* in_chars,
@@ -100,19 +132,12 @@ __global__ void gather_chars_fn(char* out_chars,
 {
   if (in_chars == nullptr || in_offsets == nullptr) return;
 
-  __shared__ char out_block[warps_per_threadblock][512];
-  __shared__ char in_block[warps_per_threadblock][512];
-
   int global_thread_id = blockIdx.x * blockDim.x + threadIdx.x;
   int global_warp_id   = global_thread_id / 32;
   int warp_lane        = global_thread_id % 32;
-  int local_warp_id    = threadIdx.x / 32;
   int nwarps           = gridDim.x * blockDim.x / 32;
 
-  int* out_chars_aligned = (int*)out_chars;
-  int* out_block_aligned = (int*)(out_block + local_warp_id);
-  int* in_chars_aligned  = (int*)in_chars;
-  int* in_block_aligned  = (int*)(in_block + local_warp_id);
+  uint4* out_chars_aligned = (uint4*)out_chars;
 
   for (cudf::size_type istring = global_warp_id; istring < total_out_strings; istring += nwarps) {
     cudf::size_type in_string_idx = string_indices[istring];
@@ -127,50 +152,15 @@ __global__ void gather_chars_fn(char* out_chars,
     cudf::size_type out_end   = out_offsets[istring + 1];
     cudf::size_type in_start  = in_offsets[in_string_idx];
 
-    cudf::size_type out_start_aligned = (out_start + 3) / 4 * 4;
-    cudf::size_type out_end_aligned   = out_end / 4 * 4;
+    cudf::size_type out_start_aligned = (out_start + 3) / 16 * 16;
+    cudf::size_type out_end_aligned   = out_end / 16 * 16;
 
-    constexpr cudf::size_type block_size = 480;
-    cudf::size_type num_blocks =
-      (out_end_aligned - out_start_aligned + block_size - 1) / block_size;
-
-    for (cudf::size_type iblock = 0; iblock < num_blocks; iblock++) {
-      cudf::size_type out_start_iblock = out_start_aligned + iblock * block_size;
-      cudf::size_type out_end_iblock   = min(out_start_iblock + block_size, out_end_aligned);
-      cudf::size_type in_start_iblock  = (out_start_iblock - out_start + in_start) / 4 * 4;
-      cudf::size_type in_end_iblock    = (out_end_iblock - out_start + in_start + 3) / 4 * 4;
-
-      // Fetch data from input to shared memory
-      cudf::size_type in_start_element = in_start_iblock / 4;
-      cudf::size_type in_end_element   = in_end_iblock / 4;
-      for (cudf::size_type ielement = in_start_element + warp_lane; ielement < in_end_element;
-           ielement += 32) {
-        in_block_aligned[ielement - in_start_element] = in_chars_aligned[ielement];
-      }
-
-      __syncwarp();
-
-      // Copy from input unaligned buffer to output unaligned buffer
-      for (cudf::size_type ichar = out_start_iblock + warp_lane; ichar < out_end_iblock;
-           ichar += 32) {
-        out_block[local_warp_id][ichar - out_start_iblock] =
-          in_block[local_warp_id][ichar - out_start + in_start - in_start_iblock];
-      }
-
-      __syncwarp();
-
-      // Copy data from output aligned buffer to output
-      cudf::size_type out_start_element = out_start_iblock / 4;
-      cudf::size_type out_end_element   = out_end_iblock / 4;
-
-      for (cudf::size_type ielement = out_start_element + warp_lane; ielement < out_end_element;
-           ielement += 32) {
-        out_chars_aligned[ielement] = out_block_aligned[ielement - out_start_element];
-      }
-      __syncwarp();
+    for (cudf::size_type ichar = out_start_aligned + warp_lane * 16; ichar < out_end_aligned;
+         ichar += 32 * 16) {
+      *(out_chars_aligned + ichar / 16) = load_uint4(in_chars + in_start + ichar - out_start);
     }
 
-    if (num_blocks == 0) {
+    if (out_end_aligned <= out_start_aligned) {
       cudf::size_type ichar = out_start + warp_lane;
       if (ichar < out_end) { out_chars[ichar] = in_chars[warp_lane + in_start]; }
     } else {
