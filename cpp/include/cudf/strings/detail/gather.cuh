@@ -32,6 +32,7 @@
 
 constexpr int warps_per_threadblock = 4;
 constexpr int threadblock_size      = warps_per_threadblock * 32;
+// constexpr int strings_per_threadblock = 32;
 
 namespace cudf {
 namespace strings {
@@ -89,7 +90,6 @@ std::unique_ptr<cudf::column> gather_chars(StringIterator strings_begin,
   return chars_column;
 }
 
-/*
 __forceinline__ __device__ uint4 load_uint4(const char* ptr)
 {
   unsigned int* aligned_ptr = (unsigned int*)((size_t)ptr & ~(3));
@@ -127,7 +127,8 @@ __global__ void gather_chars_fn(char* out_chars,
   int warp_lane        = global_thread_id % 32;
   int nwarps           = gridDim.x * blockDim.x / 32;
 
-  uint4* out_chars_aligned = (uint4*)out_chars;
+  size_t alignment_offset  = (size_t)(out_chars)&15;
+  uint4* out_chars_aligned = (uint4*)(out_chars - alignment_offset);
 
   for (cudf::size_type istring = global_warp_id; istring < total_out_strings; istring += nwarps) {
     cudf::size_type in_string_idx = string_indices[istring];
@@ -142,12 +143,14 @@ __global__ void gather_chars_fn(char* out_chars,
     cudf::size_type out_end   = out_offsets[istring + 1];
     cudf::size_type in_start  = in_offsets[in_string_idx];
 
-    cudf::size_type out_start_aligned = (out_start + 15) / 16 * 16;
-    cudf::size_type out_end_aligned   = out_end / 16 * 16;
+    cudf::size_type out_start_aligned =
+      (out_start + alignment_offset + 15) / 16 * 16 - alignment_offset;
+    cudf::size_type out_end_aligned = (out_end + alignment_offset) / 16 * 16 - alignment_offset;
 
     for (cudf::size_type ichar = out_start_aligned + warp_lane * 16; ichar < out_end_aligned;
          ichar += 32 * 16) {
-      *(out_chars_aligned + ichar / 16) = load_uint4(in_chars + in_start + ichar - out_start);
+      *(out_chars_aligned + (ichar + alignment_offset) / 16) =
+        load_uint4(in_chars + in_start + ichar - out_start);
     }
 
     if (out_end_aligned <= out_start_aligned) {
@@ -163,9 +166,6 @@ __global__ void gather_chars_fn(char* out_chars,
     }
   }
 }
-*/
-
-constexpr int strings_per_threadblock = 32;
 
 /**
  * Binary search for at most strings_per_threadblock elements.
@@ -173,6 +173,7 @@ constexpr int strings_per_threadblock = 32;
  * Requires strings_per_threadblock to be an exponential of 2.
  * @param max_nelements Must be less than strings_per_threadblock.
  */
+/*
 __forceinline__ __device__ cudf::size_type binary_search(cudf::size_type* offset,
                                                          cudf::size_type value,
                                                          cudf::size_type max_nelements)
@@ -228,6 +229,7 @@ __global__ void gather_chars_fn(char* out_chars,
     out_chars[out_ibyte] = in_chars[in_offsets[in_string_idx] + icharacter];
   }
 }
+*/
 
 /**
  * @brief Returns a new strings column using the specified indices to select
@@ -305,8 +307,10 @@ std::unique_ptr<cudf::column> gather(
     auto const d_out_chars = out_chars_column->mutable_view().template data<char>();
     auto const d_in_chars  = (strings_count > 0) ? strings.chars().data<char>() : nullptr;
 
-    int num_threadblocks = (output_count + strings_per_threadblock - 1) / strings_per_threadblock;
-    gather_chars_fn<NullifyOutOfBounds, MapIterator><<<num_threadblocks, 128, 0, stream.value()>>>(
+    // int num_threadblocks = (output_count + strings_per_threadblock - 1) /
+    // strings_per_threadblock;
+    // int num_threadblocks = 65536;
+    gather_chars_fn<NullifyOutOfBounds, MapIterator><<<65536, 128, 0, stream.value()>>>(
       d_out_chars, d_in_chars, d_out_offsets, d_in_offsets, begin, output_count, strings_count);
   }
 
