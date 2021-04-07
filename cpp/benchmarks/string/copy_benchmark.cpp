@@ -77,6 +77,9 @@ static void generate_bench_args(benchmark::internal::Benchmark* b)
 
   b->Args({67108864, 2});
   b->Args({2097152, 1024});
+
+  // b->Args({524288, 4096});
+  // b->Args({67108864, 2});
 }
 
 #define COPY_BENCHMARK_DEFINE(name)                           \
